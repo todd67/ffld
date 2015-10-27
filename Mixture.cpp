@@ -18,11 +18,14 @@
 // <http://www.gnu.org/licenses/>.
 //--------------------------------------------------------------------------------------------------
 
-#include "Intersector.h"
+//#define USE_PATCHWORK_FFT
+
 #include "Mixture.h"
 
 #include <algorithm>
 #include <fstream>
+
+#include "Intersector.h"
 
 using namespace Eigen;
 using namespace FFLD;
@@ -154,7 +157,8 @@ void Mixture::convolve(const HOGPyramid & pyramid,
 	
 	if (positions)
 		positions->resize(nbModels);
-	
+
+#ifdef USE_PATCHWORK_FFT
 	// Transform the filters if needed
 #pragma omp critical
 	if (filterCache_.empty())
@@ -186,17 +190,23 @@ void Mixture::convolve(const HOGPyramid & pyramid,
 		offsets[i] = j;
 		j += models_[i].parts_.size();
 	}
+#endif
 	
-	// For each model
+	// For each model, do 2D distance transform
+	// Note that the actual convolution is done using patchwork above!
 	int i;
 #pragma omp parallel for private(i)
 	for (i = 0; i < nbModels; ++i) {
+#ifdef USE_PATCHWORK_FFT
 		vector<vector<HOGPyramid::Matrix> > tmp(models_[i].parts_.size());
 		
 		for (size_t j = 0; j < tmp.size(); ++j)
 			tmp[j].swap(convolutions[offsets[i] + j]);
 		
 		models_[i].convolve(pyramid, tmp, scores[i], positions ? &(*positions)[i] : 0);
+#else
+		models_[i].convolve(pyramid, scores[i], positions ? &(*positions)[i] : 0);
+#endif
 	}
 }
 

@@ -18,12 +18,20 @@
 // <http://www.gnu.org/licenses/>.
 //--------------------------------------------------------------------------------------------------
 
+#define USE_CUDNN
+
 #include "HOGPyramid.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <limits>
+
+#ifdef USE_CUDNN
+#include <caffe/caffe.hpp>
+#include <caffe/util/cudnn.hpp>
+#include "helper/WeardexLogging.h"
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -154,11 +162,145 @@ void HOGPyramid::convolve(const Level & filter, vector<Matrix> & convolutions) c
 	// Resize convolutions to hold # levels
 	convolutions.resize(levels_.size());
 	
+#ifdef USE_CUDNN
+//	WEARDEX_LOG_INFO("Preparing cudnn convolution.");
+
+    // Create cudnn tensor descriptors
+    cudnnTensorDescriptor_t bottom_desc;
+    caffe::cudnn::createTensor4dDesc<Scalar>(&bottom_desc);
+
+    cudnnTensorDescriptor_t top_desc;
+    caffe::cudnn::createTensor4dDesc<Scalar>(&top_desc);
+
+    cudnnConvolutionDescriptor_t conv_desc;
+    caffe::cudnn::createConvolutionDesc<Scalar>(&conv_desc);
+
+    // Prepare filter
+    cudnnFilterDescriptor_t filter_desc;
+//    WEARDEX_LOG_INFO("Creating feature of size 1x" << NbFeatures << "x" << filter.rows() << "x" << filter.cols());
+    vector<int> filter_shape = {
+        1,              // num
+        NbFeatures,     // channel
+        (int) filter.rows(),  // height
+        (int) filter.cols()   // width
+    };
+    caffe::cudnn::createFilterDesc<Scalar>(&filter_desc,
+        filter_shape[0], filter_shape[1], filter_shape[2], filter_shape[3]);
+    caffe::Blob<HOGPyramid::Scalar> weight;
+    weight.Reshape(filter_shape);
+
+    auto filter_data = weight.mutable_cpu_data();
+
+//    WEARDEX_LOG_INFO("Transfering filter data...");
+
+    for (int c = 0; c < NbFeatures; ++c)
+        for (int h = 0; h < filter.rows(); ++h)
+            for (int w = 0; w < filter.cols(); ++w)
+                filter_data[weight.offset(0, c, h, w)] = filter(h, w)(c);
+
+//    WEARDEX_LOG_INFO("Preparing CUDNN...");
+
+    // Prepare CUDNN
+    cudaStream_t stream;
+    cudnnHandle_t handle;
+
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    CUDNN_CHECK(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnSetStream(handle, stream));
+
+    // Input and output
+    caffe::Blob<HOGPyramid::Scalar> bottom;
+    caffe::Blob<HOGPyramid::Scalar> top;
+
+    for (int i = 0; i < levels_.size(); ++i)
+    {
+//        WEARDEX_LOG_INFO("Running cudnn convolution.");
+
+        const Level& image = levels_[i];
+
+        // Prepare convolution data blobs
+        vector<int> bottom_shape = {
+            1,              // num
+            NbFeatures,     // channel
+            (int) image.rows(),   // height
+            (int) image.cols()    // width
+        };
+        bottom.Reshape(bottom_shape);
+        caffe::cudnn::setTensor4dDesc<Scalar>(&bottom_desc,
+            bottom_shape[0], bottom_shape[1], bottom_shape[2], bottom_shape[3]);
+
+        auto bottom_data = bottom.mutable_cpu_data();
+
+        for (int c = 0; c < NbFeatures; ++c)
+            for (int h = 0; h < image.rows(); ++h)
+                for (int w = 0; w < image.cols(); ++w)
+                    bottom_data[bottom.offset(0, c, h, w)] = image(h, w)(c);
+
+        vector<int> top_shape = {
+            1,
+            1,
+            (int) (image.rows() - filter.rows() + 1),
+            (int) (image.cols() - filter.cols() + 1)
+        };
+        top.Reshape(top_shape);
+        caffe::cudnn::setTensor4dDesc<Scalar>(&top_desc,
+            top_shape[0], top_shape[1], top_shape[2], top_shape[3]);
+
+        caffe::cudnn::setConvolutionDesc<Scalar>(&conv_desc,
+            bottom_desc, filter_desc, 0, 0, 1, 1);
+
+        // Actual convolution
+        cudnnConvolutionFwdAlgo_t algo;
+
+        CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithm(handle,
+            bottom_desc, filter_desc, conv_desc, top_desc,
+            CUDNN_CONVOLUTION_FWD_NO_WORKSPACE, 0, &algo));
+
+        CUDNN_CHECK(cudnnConvolutionForward(handle,
+                                            caffe::cudnn::dataType<Scalar>::one,
+                                            bottom_desc,
+                                            bottom.gpu_data(),
+                                            filter_desc,
+                                            weight.gpu_data(),
+                                            conv_desc,
+                                            algo,
+                                            NULL,
+                                            0,
+                                            caffe::cudnn::dataType<Scalar>::zero,
+                                            top_desc,
+                                            top.mutable_gpu_data()
+                                            ));
+
+//        WEARDEX_LOG_INFO("Outputing cudnn convolution.");
+
+        //convolutions[i] = Matrix::Zero(top_shape[2], top_shape[3]);
+
+        convolutions[i].resize(top_shape[2], top_shape[3]);
+
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        auto ret = top.cpu_data();
+
+        for (int h = 0; h < top_shape[2]; ++h)
+            for (int w = 0; w < top_shape[3]; ++w)
+                convolutions[i](h, w) = ret[top.offset(0, 0, h, w)];
+    }
+
+    cudnnDestroyTensorDescriptor(bottom_desc);
+    cudnnDestroyTensorDescriptor(top_desc);
+    cudnnDestroyFilterDescriptor(filter_desc);
+    cudnnDestroyConvolutionDescriptor(conv_desc);
+
+    cudaStreamDestroy(stream);
+    cudnnDestroy(handle);
+
+#else
 	// For each level
 	int i;
 #pragma omp parallel for private(i)
 	for (i = 0; i < levels_.size(); ++i)
 		Convolve(levels_[i], filter, convolutions[i]);
+#endif
 }
 
 void HOGPyramid::convolve(const Level & filter, vector<SparseMatrix> & convolutions) const
