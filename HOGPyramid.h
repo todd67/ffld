@@ -146,7 +146,7 @@ public:
 	/// @param[in] filter Filter.
 	/// @param[out] convolutions Convolution for each level.
 	/// @note cudnn_prepare() must be invoked at least once.
-	void cudnn_convolve(const Level & filter, std::vector<Matrix> & convolutions) const;
+	void cudnn_convolve(std::vector<const Level*> & filter, std::vector<std::vector<Matrix>> & convolutions) const;
 
 	/// Release the GPU environment for cudnn_convolve
 	void cudnn_release();
@@ -200,9 +200,10 @@ private:
 	std::vector< std::unique_ptr<caffe::Blob<HOGPyramid::Scalar>> > bottoms_;
 	std::vector< std::unique_ptr<caffe::Blob<HOGPyramid::Scalar>> > tops_;
 
-	std::vector<cudnnTensorDescriptor_t>		bottom_descs_;
-	std::vector<cudaStream_t>					streams_;
-	std::vector<cudnnHandle_t>					handles_;
+	std::vector<cudnnTensorDescriptor_t>	bottom_descs_;
+	std::vector<cudnnTensorDescriptor_t>	top_descs_;
+	cudaStream_t							stream_;
+	cudnnHandle_t							handle_;
 #endif
 };
 }
