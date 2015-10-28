@@ -197,12 +197,13 @@ private:
 	std::vector<Level> levels_;
 
 #ifdef USE_CUDNN
-	std::vector< std::unique_ptr<caffe::Blob<HOGPyramid::Scalar>> > bottoms_;
-	std::vector< std::unique_ptr<caffe::Blob<HOGPyramid::Scalar>> > tops_;
+	std::unique_ptr<caffe::Blob<HOGPyramid::Scalar>> bottom_;
+	std::unique_ptr<caffe::Blob<HOGPyramid::Scalar>> top_;
 
-	std::vector<cudnnTensorDescriptor_t>		bottom_descs_;
-	std::vector<cudaStream_t>					streams_;
-	std::vector<cudnnHandle_t>					handles_;
+	cudnnTensorDescriptor_t		bottom_desc_;
+	cudnnTensorDescriptor_t		top_desc_;
+	cudaStream_t				stream_;
+	cudnnHandle_t				handle_;
 #endif
 };
 }
