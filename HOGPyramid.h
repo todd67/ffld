@@ -21,10 +21,18 @@
 #ifndef FFLD_HOGPYRAMID_H
 #define FFLD_HOGPYRAMID_H
 
+#define USE_CUDNN
+
 #include "JPEGImage.h"
 
 #include <Eigen/Core>
 #include <Eigen/Sparse>
+
+#ifdef USE_CUDNN
+#include <caffe/caffe.hpp>
+#include <caffe/util/cudnn.hpp>
+#include "helper/WeardexLogging.h"
+#endif
 
 namespace FFLD
 {
@@ -66,6 +74,7 @@ public:
 	
 	/// Constructs an empty pyramid. An empty pyramid has no level.
 	HOGPyramid();
+	~HOGPyramid();
 	
 	/// Constructs a pyramid from parameters and a list of levels.
 	/// @param[in] padx Amount of horizontal zero padding (in cells).
@@ -128,6 +137,21 @@ public:
 	/// @note In case labels are empty the sum will be empty too.
 	void convolve(const std::vector<SparseMatrix> & labels, Level & sum) const;
 	
+#ifdef USE_CUDNN
+	/// Prepare the GPU environment for cudnn_convolve
+	/// @note Memory is copied here.
+	void cudnn_prepare();
+
+	/// Returns the convolutions of the pyramid with a filter (useful to compute the SVM margins).
+	/// @param[in] filter Filter.
+	/// @param[out] convolutions Convolution for each level.
+	/// @note cudnn_prepare() must be invoked at least once.
+	void cudnn_convolve(const Level & filter, std::vector<Matrix> & convolutions) const;
+
+	/// Release the GPU environment for cudnn_convolve
+	void cudnn_release();
+#endif
+
 	/// Converts a pyramid level to a simple matrix (useful to apply standard matrix operations to
 	/// it).
 	/// @note The size of the matrix will be rows x (cols * NbFeatures).
@@ -171,6 +195,15 @@ private:
 	int pady_;
 	int interval_;
 	std::vector<Level> levels_;
+
+#ifdef USE_CUDNN
+	std::vector< std::unique_ptr<caffe::Blob<HOGPyramid::Scalar>> > bottoms_;
+	std::vector< std::unique_ptr<caffe::Blob<HOGPyramid::Scalar>> > tops_;
+
+	std::vector<cudnnTensorDescriptor_t>		bottom_descs_;
+	std::vector<cudaStream_t>					streams_;
+	std::vector<cudnnHandle_t>					handles_;
+#endif
 };
 }
 

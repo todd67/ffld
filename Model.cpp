@@ -77,7 +77,13 @@ void Model::convolve(const HOGPyramid & pyramid, vector<HOGPyramid::Matrix> & sc
 	int i;
 #pragma omp parallel for private(i)
 	for (i = 0; i < nbFilters; ++i)
+	{
+#ifdef USE_CUDNN
+		pyramid.cudnn_convolve(parts_[i].filter, convolutions[i]);
+#else
 		pyramid.convolve(parts_[i].filter, convolutions[i]);
+#endif
+	}
 	
 	convolve(pyramid, convolutions, scores, positions);
 }
