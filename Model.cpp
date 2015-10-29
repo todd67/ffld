@@ -61,6 +61,62 @@ Model::Scalar Model::bias() const
 	return bias_;
 }
 
+#ifdef USE_CUDNN
+void Model::cudnn_prepare()
+{
+    // Already prepared?
+    if (weight_ || parts_.size() == 0)
+        return ;
+
+    // Prepare filter
+    int filter_height = -1;
+    int filter_width  = -1;
+
+    for (const auto& part : parts_)
+    {
+        filter_height = std::max(filter_height, (int) part.filter.rows());
+        filter_width  = std::max(filter_width,  (int) part.filter.cols());
+    }
+
+    vector<int> filter_shape = {
+        (int) parts_.size(),
+        HOGPyramid::NbFeatures,
+        filter_height,
+        filter_width
+    };
+
+    caffe::cudnn::createFilterDesc<Scalar>(&filter_desc_,
+        filter_shape[0], filter_shape[1], filter_shape[2], filter_shape[3]);
+
+    weight_.reset(new caffe::Blob<HOGPyramid::Scalar>());
+    weight_->Reshape(filter_shape);
+
+    auto filter_data = weight_->mutable_cpu_data();
+
+    std::fill_n(filter_data, weight_->count(), 0);
+
+    for (int i = 0; i < parts_.size(); ++i)
+    {
+        const auto &filter = parts_[i].filter;
+
+        for (int c = 0; c < HOGPyramid::NbFeatures; ++c)
+            for (int h = 0; h < filter.rows(); ++h)
+                for (int w = 0; w < filter.cols(); ++w)
+                    filter_data[weight_->offset(i, c, h, w)] = filter(h, w)(c);
+    }
+}
+
+void Model::cudnn_release()
+{
+	if (!weight_)
+		return ;
+
+	weight_.reset();
+
+	CUDNN_CHECK(cudnnDestroyFilterDescriptor(filter_desc_));
+}
+#endif
+
 void Model::convolve(const HOGPyramid & pyramid, vector<HOGPyramid::Matrix> & scores,
 					 vector<vector<Positions> > * positions) const
 {
@@ -75,12 +131,13 @@ void Model::convolve(const HOGPyramid & pyramid, vector<HOGPyramid::Matrix> & sc
 	vector<vector<HOGPyramid::Matrix> > convolutions;
 
 #ifdef USE_CUDNN
-	vector<const HOGPyramid::Level*> filters;
+	if (!weight_)
+	{
+		WEARDEX_LOG_ERROR("cudnn_prepare() not yet invoked.");
+		return ;
+	}
 
-	for (int i = 0; i < nbFilters; ++i)
-		filters.push_back(&parts_[i].filter);
-
-	pyramid.cudnn_convolve(filters, convolutions);
+	pyramid.cudnn_convolve(*weight_, filter_desc_, convolutions);
 #else
 	convolutions.resize(nbFilters);
 	int i;

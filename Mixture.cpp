@@ -81,6 +81,15 @@ pair<int, int> Mixture::maxSize() const
 	return size;
 }
 
+#ifdef USE_CUDNN
+void Mixture::cudnn_prepare()
+{
+	for (auto & model : models_)
+		model.cudnn_prepare();
+}
+#endif
+
+
 void Mixture::convolve(const HOGPyramid & pyramid, vector<HOGPyramid::Matrix> & scores,
 					   vector<Indices> & argmaxes,
 					   vector<vector<vector<Model::Positions> > > * positions) const

@@ -43,7 +43,7 @@ pady_(0), interval_(0)
 {
 	if ((padx < 1) || (pady < 1) || (interval < 1))
 		return;
-	
+
 	padx_ = padx;
 	pady_ = pady;
 	interval_ = interval;
@@ -57,34 +57,34 @@ pady_(0), interval_(0)
 {
 	if (image.empty() || (padx < 1) || (pady < 1) || (interval < 1))
 		return;
-	
+
 	// Copmute the number of scales such that the smallest size of the last level is 5
 	const int maxScale = ceil(log(min(image.width(), image.height()) / 40.0) / log(2.0)) * interval;
-	
+
 	// Cannot compute the pyramid on images too small
 	if (maxScale < interval)
 		return;
-	
+
 	padx_ = padx;
 	pady_ = pady;
 	interval_ = interval;
 	levels_.resize(maxScale + 1);
-	
+
 	int i;
 #pragma omp parallel for private(i)
 	for (i = 0; i < interval; ++i) {
 		double scale = pow(2.0, static_cast<double>(-i) / interval);
-		
+
 		JPEGImage scaled = image.resize(image.width() * scale + 0.5, image.height() * scale + 0.5);
-		
+
 		// First octave at twice the image resolution
 #ifndef FFLD_HOGPYRAMID_FELZENSZWALB_FEATURES
 		Hog(scaled, levels_[i], padx, pady, 4);
-		
+
 		// Second octave at the original resolution
 		if (i + interval <= maxScale)
 			Hog(scaled, levels_[i + interval], padx, pady, 8);
-		
+
 		// Remaining octaves
 		for (int j = 2; i + j * interval <= maxScale; ++j) {
 			scale *= 0.5;
@@ -93,12 +93,12 @@ pady_(0), interval_(0)
 		}
 #else
 		Hog(scaled.scanLine(0), scaled.width(), scaled.height(), scaled.depth(), levels_[i], 4);
-		
+
 		// Second octave at the original resolution
 		if (i + interval <= maxScale)
 			Hog(scaled.scanLine(0), scaled.width(), scaled.height(), scaled.depth(),
 				levels_[i + interval], 8);
-		
+
 		// Remaining octaves
 		for (int j = 2; i + j * interval <= maxScale; ++j) {
 			scale *= 0.5;
@@ -108,20 +108,20 @@ pady_(0), interval_(0)
 		}
 #endif
 	}
-	
+
 	// Add padding
 #ifdef FFLD_HOGPYRAMID_FELZENSZWALB_FEATURES
 	for (int i = 0; i <= maxScale; ++i) {
 		Level tmp = Level::Constant(levels_[i].rows() + (pady + 1) * 2,
 									levels_[i].cols() + (padx + 1) * 2, Cell::Zero());
-		
+
 		// Set the last feature to 1
 		for (int y = 0; y < tmp.rows(); ++y)
 			for (int x = 0; x < tmp.cols(); ++x)
 				tmp(y, x)(31) = 1;
-		
+
 		tmp.block(pady + 1, padx + 1, levels_[i].rows(), levels_[i].cols()) = levels_[i];
-		
+
 		levels_[i].swap(tmp);
 	}
 #endif
@@ -163,7 +163,7 @@ void HOGPyramid::convolve(const Level & filter, vector<Matrix> & convolutions) c
 {
 	// Resize convolutions to hold # levels
 	convolutions.resize(levels_.size());
-	
+
 	// For each level
 	int i;
 #pragma omp parallel for private(i)
@@ -177,17 +177,19 @@ void HOGPyramid::cudnn_prepare()
     if (!bottoms_.empty())
         cudnn_release();
 
-    WEARDEX_LOG_INFO("Preparing cudnn convolution.");
+//    WEARDEX_LOG_INFO("Preparing cudnn convolution.");
 
     // Prepare cudnn environment
-    CUDA_CHECK(cudaStreamCreate(&stream_));
-    CUDNN_CHECK(cudnnCreate(&handle_));
-    CUDNN_CHECK(cudnnSetStream(handle_, stream_));
-
+    streams_.resize(levels_.size());
+    handles_.resize(levels_.size());
     bottom_descs_.resize(levels_.size());
 
     for (int i = 0; i < levels_.size(); ++i)
     {
+        CUDA_CHECK(cudaStreamCreate(&streams_[i]));
+        CUDNN_CHECK(cudnnCreate(&handles_[i]));
+        CUDNN_CHECK(cudnnSetStream(handles_[i], streams_[i]));
+
         bottoms_.emplace_back(new caffe::Blob<HOGPyramid::Scalar>());
         tops_.emplace_back(new caffe::Blob<HOGPyramid::Scalar>());
 
@@ -205,20 +207,27 @@ void HOGPyramid::cudnn_prepare()
         };
         bottom.Reshape(bottom_shape);
 
-        auto bottom_data = bottom.mutable_cpu_data();
+        const auto image_data   = image.data();
+        auto bottom_data        = bottom.mutable_cpu_data();
 
         for (int c = 0; c < NbFeatures; ++c)
             for (int h = 0; h < image.rows(); ++h)
-                for (int w = 0; w < image.cols(); ++w)
-                    bottom_data[bottom.offset(0, c, h, w)] = image(h, w)(c);
+            {
+                int idx_1 = bottom.offset(0, c, h, 0);
+                int idx_2 = h * image.cols();
 
-//        vector<int> top_shape = {
-//            1,
-//            1,
-//            (int) image.rows(),
-//            (int) image.cols()
-//        };
-//        top.Reshape(top_shape);
+                for (int w = 0; w < image.cols(); ++w)
+                    bottom_data[idx_1 + w] = image_data[idx_2 + w](c);
+            }
+
+        // Preallocate top blob, assuming 10 filters at most
+        vector<int> top_shape = {
+            1,
+            10,
+            (int) image.rows(),
+            (int) image.cols()
+        };
+        top.Reshape(top_shape);
 
         // Create bottom cudnn tensor descriptors
         caffe::cudnn::createTensor4dDesc<Scalar>(&bottom_descs_[i]);
@@ -233,16 +242,22 @@ void HOGPyramid::cudnn_release()
         return ;
 
     for (int i = 0; i < bottoms_.size(); ++i)
+    {
         CUDNN_CHECK(cudnnDestroyTensorDescriptor(bottom_descs_[i]));
+        CUDNN_CHECK(cudnnDestroy(handles_[i]));
+        CUDA_CHECK(cudaStreamDestroy(streams_[i]));
+    }
 
-    CUDNN_CHECK(cudnnDestroy(handle_));
-    CUDA_CHECK(cudaStreamDestroy(stream_));
     bottom_descs_.clear();
+    handles_.clear();
+    streams_.clear();
     bottoms_.clear();
     tops_.clear();
 }
 
-void HOGPyramid::cudnn_convolve(vector<const Level*> & filters, vector<vector<Matrix>> & convolutions) const
+void HOGPyramid::cudnn_convolve(const caffe::Blob<Scalar> &weight,
+								const cudnnFilterDescriptor_t &filter_desc,
+								vector<vector<Matrix>> & convolutions) const
 {
 	if (bottoms_.empty())
 	{
@@ -250,63 +265,24 @@ void HOGPyramid::cudnn_convolve(vector<const Level*> & filters, vector<vector<Ma
 		return ;
 	}
 
-    // Prepare filter
-    int filter_max_height = -1;
-    int filter_max_width  = -1;
-
-    for (const auto &filter_ptr : filters)
-    {
-        filter_max_height = std::max(filter_max_height, (int) filter_ptr->rows());
-        filter_max_width  = std::max(filter_max_width, (int) filter_ptr->cols());
-    }
-
-    cudnnFilterDescriptor_t filter_desc;
-    vector<int> filter_shape = {
-        (int) filters.size(),
-        NbFeatures,
-        filter_max_height,
-        filter_max_width
-    };
-    caffe::cudnn::createFilterDesc<Scalar>(&filter_desc,
-        filter_shape[0], filter_shape[1], filter_shape[2], filter_shape[3]);
-    caffe::Blob<HOGPyramid::Scalar> weight;
-    weight.Reshape(filter_shape);
-
-    auto filter_data = weight.mutable_cpu_data();
-
-    std::fill_n(filter_data, weight.count(), 0);
-
-    for (int i = 0; i < filters.size(); ++i)
-    {
-        const auto &filter = *filters[i];
-
-        for (int c = 0; c < NbFeatures; ++c)
-            for (int h = 0; h < filter.rows(); ++h)
-                for (int w = 0; w < filter.cols(); ++w)
-                    filter_data[weight.offset(i, c, h, w)] = filter(h, w)(c);
-    }
-
-    cudnnConvolutionDescriptor_t conv_desc;
-    cudnnTensorDescriptor_t top_desc;
-
-    caffe::cudnn::createConvolutionDesc<Scalar>(&conv_desc);
-    caffe::cudnn::createTensor4dDesc<Scalar>(&top_desc);
+    std::vector<cudnnConvolutionDescriptor_t> conv_descs(levels_.size());
+    std::vector<cudnnTensorDescriptor_t> top_descs(levels_.size());
+    std::vector<void*> workspaces(levels_.size());
 
     auto algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
 //    auto algo = CUDNN_CONVOLUTION_FWD_ALGO_GEMM;
 
-    auto timer_start = std::chrono::high_resolution_clock::now();
+//    CUDA_CHECK(cudaDeviceSynchronize());
+//    auto timer_start = std::chrono::high_resolution_clock::now();
 
-    size_t workspace_size_in_bytes = 0;
-    void*  workspace = NULL;
-
-//    WEARDEX_LOG_INFO("Input shape: " << levels_.size() << "x" << bottoms_[0]->shape(1) << "x" << bottoms_[0]->shape(2)  << "x" << bottoms_[0]->shape(3));
 //    WEARDEX_LOG_INFO("Filter shape: " << weight.shape(0) << "x" << weight.shape(1) << "x" << weight.shape(2)  << "x" << weight.shape(3));
 
     for (int i = 0; i < levels_.size(); ++i)
     {
         auto& bottom = *bottoms_[i];
         auto& top    = *tops_[i];
+
+//        WEARDEX_LOG_INFO("Bottom shape: " << bottom.shape(1) << "x" << bottom.shape(2)  << "x" << bottom.shape(3));
 
         vector<int> top_shape = {
             bottom.shape(0),
@@ -317,66 +293,64 @@ void HOGPyramid::cudnn_convolve(vector<const Level*> & filters, vector<vector<Ma
         top.Reshape(top_shape);
 
         // Prepare convolution description
-        caffe::cudnn::setConvolutionDesc<Scalar>(&conv_desc,
+        caffe::cudnn::createConvolutionDesc<Scalar>(&conv_descs[i]);
+        caffe::cudnn::createTensor4dDesc<Scalar>(&top_descs[i]);
+
+        caffe::cudnn::setConvolutionDesc<Scalar>(&conv_descs[i],
             bottom_descs_[i], filter_desc, 0, 0, 1, 1);
 
-        caffe::cudnn::setTensor4dDesc<Scalar>(&top_desc,
+        caffe::cudnn::setTensor4dDesc<Scalar>(&top_descs[i],
             top_shape[0], top_shape[1], top_shape[2], top_shape[3]);
 
         // Preparing workspace; only first iteration since levels get smaller subsequently
-        if (i == 0)
-        {
-            CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(handle_,
-                bottom_descs_[i],
-                filter_desc,
-                conv_desc,
-                top_desc,
-                algo,
-                &workspace_size_in_bytes));
+        size_t workspace_size_in_bytes = 0;
+
+        CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(handles_[i],
+            bottom_descs_[i],
+            filter_desc,
+            conv_descs[i],
+            top_descs[i],
+            algo,
+            &workspace_size_in_bytes));
 
 //            WEARDEX_LOG_INFO("Workspace: " << workspace_size_in_bytes);
 
-            cudaError_t err = cudaMalloc(&workspace, workspace_size_in_bytes);
-            if (err != cudaSuccess) {
-                // force zero memory path
-                algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
-                workspace = NULL;
-                workspace_size_in_bytes = 0;
-            }
-        }
+        CUDA_CHECK(cudaMalloc(&workspaces[i], workspace_size_in_bytes));
 
         // Actual convolution
         CUDNN_CHECK(cudnnConvolutionForward(
-                        handle_,
+                        handles_[i],
                         caffe::cudnn::dataType<Scalar>::one,
                         bottom_descs_[i],
                         bottom.gpu_data(),
                         filter_desc,
                         weight.gpu_data(),
-                        conv_desc,
+                        conv_descs[i],
                         algo,
-                        workspace,
+                        workspaces[i],
                         workspace_size_in_bytes,
                         caffe::cudnn::dataType<Scalar>::zero,
-                        top_desc,
+                        top_descs[i],
                         top.mutable_gpu_data()
                     ));
     }
 
     // Synchronize
-    CUDA_CHECK(cudaStreamSynchronize(stream_));
+    for (int i = 0; i < levels_.size(); ++i)
+        CUDA_CHECK(cudaStreamSynchronize(streams_[i]));
 
-    auto timer_end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(timer_end - timer_start).count();
+//    auto timer_end = std::chrono::high_resolution_clock::now();
+//    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(timer_end - timer_start).count();
 
-    WEARDEX_LOG_INFO("convolution Success in " << duration << " micro seconds");
+//    WEARDEX_LOG_INFO("convolution Success in " << duration << " micro seconds");
 
-    timer_start = std::chrono::high_resolution_clock::now();
+//    timer_start = std::chrono::high_resolution_clock::now();
 
     // Copy result and clean up
-    int offset = convolutions.size();
+    int offset      = convolutions.size();
+    int nbFilters   = weight.shape(0);
 
-    for (int k = 0; k < filters.size(); ++k)
+    for (int k = 0; k < nbFilters; ++k)
         convolutions.emplace_back(levels_.size());
 
     for (int i = 0; i < levels_.size(); ++i)
@@ -386,27 +360,24 @@ void HOGPyramid::cudnn_convolve(vector<const Level*> & filters, vector<vector<Ma
 
         const int top_size = top.shape(2) * top.shape(3);
 
-        for (int k = 0; k < filters.size(); ++k)
+        for (int k = 0; k < nbFilters; ++k)
         {
             convolutions[offset + k][i].resize(top.shape(2), top.shape(3));
 
             std::copy(ret + top_size * k, ret + top_size * (k+1), convolutions[offset + k][i].data());
         }
+
+        CUDNN_CHECK(cudnnDestroyConvolutionDescriptor(conv_descs[i]));
+        CUDNN_CHECK(cudnnDestroyTensorDescriptor(top_descs[i]));
+        CUDA_CHECK(cudaFree(workspaces[i]));
     }
 
-    CUDA_CHECK(cudaDeviceSynchronize());
+//    CUDA_CHECK(cudaDeviceSynchronize());
 
-    timer_end = std::chrono::high_resolution_clock::now();
-    duration = std::chrono::duration_cast<std::chrono::microseconds>(timer_end - timer_start).count();
+//    timer_end = std::chrono::high_resolution_clock::now();
+//    duration = std::chrono::duration_cast<std::chrono::microseconds>(timer_end - timer_start).count();
 
-    WEARDEX_LOG_INFO("copy Success in " << duration << " micro seconds");
-
-    CUDNN_CHECK(cudnnDestroyConvolutionDescriptor(conv_desc));
-    CUDNN_CHECK(cudnnDestroyTensorDescriptor(top_desc));
-    CUDNN_CHECK(cudnnDestroyFilterDescriptor(filter_desc));
-
-    if (workspace)
-        CUDA_CHECK(cudaFree(workspace));
+//    WEARDEX_LOG_INFO("copy Success in " << duration << " micro seconds");
 }
 #endif
 
@@ -414,7 +385,7 @@ void HOGPyramid::convolve(const Level & filter, vector<SparseMatrix> & convoluti
 {
 	// Resize convolutions to hold # levels
 	convolutions.resize(levels_.size());
-	
+
 	// For each level
 	int i;
 #pragma omp parallel for private(i)
@@ -429,18 +400,18 @@ void HOGPyramid::convolve(const vector<Matrix> & labels, Level & sum) const
 		sum = Level();
 		return;
 	}
-	
+
 	// Resize sum to the filter size
 	sum = Level::Constant(levels_[0].rows() - labels[0].rows() + 1,
 						  levels_[0].cols() - labels[0].cols() + 1, Cell::Zero());
-	
+
 	// For each level
 	int i;
 #pragma omp parallel for private(i)
 	for (i = 0; i < min(levels_.size(), labels.size()); ++i) {
 		Level tmp;
 		Convolve(levels_[i], labels[i], tmp);
-		
+
 		if (tmp.size())
 #pragma omp critical
 			sum += tmp;
@@ -454,18 +425,18 @@ void HOGPyramid::convolve(const vector<SparseMatrix> & labels, Level & sum) cons
 		sum = Level();
 		return;
 	}
-	
+
 	// Resize sum to the filter size
 	sum = Level::Constant(levels_[0].rows() - labels[0].rows() + 1,
 						  levels_[0].cols() - labels[0].cols() + 1, Cell::Zero());
-	
+
 	// For each level
 	int i;
 #pragma omp parallel for private(i)
 	for (i = 0; i < min(levels_.size(), labels.size()); ++i) {
 		Level tmp;
 		Convolve(levels_[i], labels[i], tmp);
-		
+
 		if (tmp.size())
 #pragma omp critical
 			sum += tmp;
@@ -493,15 +464,15 @@ FFLD::HOGPyramid::Level HOGPyramid::Flip(const HOGPyramid::Level & filter)
 		28, 27, 30, 29, // Texture
 		31 // Truncation
 	};
-	
+
 	// Symmetric filter
 	HOGPyramid::Level result(filter.rows(), filter.cols());
-	
+
 	for (int y = 0; y < filter.rows(); ++y)
 		for (int x = 0; x < filter.cols(); ++x)
 			for (int i = 0; i < NbFeatures; ++i)
 				result(y, x)(i) = filter(y, filter.cols() - 1 - x)(symmetry[i]);
-	
+
 	return result;
 }
 
@@ -520,13 +491,13 @@ template <class Matrix, int CellSize>
 	const int j = (x - CellSize / 2) / CellSize;
 	const int k = (y - CellSize / 2) & (CellSize - 1);
 	const int l = (x - CellSize / 2) & (CellSize - 1);
-	
+
 	// Bilinear interpolation
 	const int a = k * 2 + 1;
 	const int b = CellSize * 2 - a;
 	const int c = l * 2 + 1;
 	const int d = CellSize * 2 - c;
-	
+
 	matrix(i    , j    )(bin0) += magnitude0 * (b * d);
 	matrix(i    , j    )(bin1) += magnitude1 * (b * d);
 	matrix(i    , j + 1)(bin0) += magnitude0 * (b * c);
@@ -544,7 +515,7 @@ void HOGPyramid::Hog(const JPEGImage & image, Level & level, int padx, int pady,
 {
 	// Table of all the possible tangents (1MB)
 	static Scalar ATAN2_TABLE[512][512] = {{0}};
-	
+
 	// Fill the atan2 table
 #pragma omp critical
 	if (ATAN2_TABLE[0][0] == 0) {
@@ -552,26 +523,26 @@ void HOGPyramid::Hog(const JPEGImage & image, Level & level, int padx, int pady,
 			for (int dx = -255; dx <= 255; ++dx) {
 				// Angle in the range [-pi, pi]
 				double angle = atan2(static_cast<double>(dy), static_cast<double>(dx));
-				
+
 				// Convert it to the range [9.0, 27.0]
 				angle = angle * (9.0 / M_PI) + 18.0;
-				
+
 				// Convert it to the range [0, 18)
 				if (angle >= 18.0)
 					angle -= 18.0;
-				
+
 				ATAN2_TABLE[dy + 255][dx + 255] = max(angle, 0.0);
 			}
 		}
 	}
-	
+
 	while (ATAN2_TABLE[510][510] == 0);
-	
+
 	// Get all the image members
 	const int width = image.width();
 	const int height = image.height();
 	const int depth = image.depth();
-	
+
 	// Make sure the image is big enough
 	assert(width >= cellSize / 2);
 	assert(height >= cellSize / 2);
@@ -579,46 +550,46 @@ void HOGPyramid::Hog(const JPEGImage & image, Level & level, int padx, int pady,
 	assert(padx >= 1);
 	assert(pady >= 1);
 	assert((cellSize == 8) || (cellSize == 4));
-	
+
 	// Resize the feature matrix
 	level = Level::Constant((height + cellSize / 2) / cellSize + pady * 2,
 							(width + cellSize / 2) / cellSize + padx * 2, Cell::Zero());
-	
+
 	for (int y = 0; y < height; ++y) {
 		const int yp = min(y + 1, height - 1);
 		const int ym = max(y - 1, 0);
-		
+
 		const uint8_t * linep = reinterpret_cast<const uint8_t *>(image.scanLine(yp));
 		const uint8_t * line = reinterpret_cast<const uint8_t *>(image.scanLine(y));
 		const uint8_t * linem = reinterpret_cast<const uint8_t *>(image.scanLine(ym));
-		
+
 		for (int x = 0; x < width; ++x) {
 			const int xp = min(x + 1, width - 1);
 			const int xm = max(x - 1, 0);
-			
+
 			// Use the channel with the largest gradient magnitude
 			Scalar magnitude = 0;
 			Scalar theta = 0;
-			
+
 			for (int i = 0; i < depth; ++i) {
 				const int dx = static_cast<int>(line[xp * depth + i]) -
 							   static_cast<int>(line[xm * depth + i]);
 				const int dy = static_cast<int>(linep[x * depth + i]) -
 							   static_cast<int>(linem[x * depth + i]);
-				
+
 				if (dx * dx + dy * dy > magnitude) {
 					magnitude = dx * dx + dy * dy;
 					theta = ATAN2_TABLE[dy + 255][dx + 255];
 				}
 			}
-			
+
 			magnitude = sqrt(magnitude);
-			
+
 			// Bilinear interpolation
 			const int theta0 = theta;
 			const int theta1 = (theta0 < 17) ? (theta0 + 1) : 0;
 			const Scalar alpha = theta - theta0;
-			
+
 			if (cellSize == 8)
 				detail::interpolate<Level, 8>(x + padx * cellSize, y + pady * cellSize,
 												theta0, theta1, magnitude * (1 - alpha),
@@ -629,23 +600,23 @@ void HOGPyramid::Hog(const JPEGImage & image, Level & level, int padx, int pady,
 												magnitude * alpha, level);
 		}
 	}
-	
+
 	// Compute the "gradient energy" of each cell, i.e. ||C(i,j)||^2
 	for (int y = 0; y < level.rows(); ++y) {
 		for (int x = 0; x < level.cols(); ++x) {
 			Scalar sumSq = 0;
-			
+
 			for (int i = 0; i < 9; ++i)
 				sumSq += (level(y, x)(i) + level(y, x)(i + 9)) *
 						 (level(y, x)(i) + level(y, x)(i + 9));
-			
+
 			level(y, x)(NbFeatures - 1) = sumSq;
 		}
 	}
-	
+
 	// Compute the four normalization factors then normalize and clamp everything
 	const Scalar EPS = numeric_limits<Scalar>::epsilon();
-	
+
 	for (int y = pady; y < level.rows() - pady; ++y) {
 		for (int x = padx; x < level.cols() - padx; ++x) {
 			// Normalization factors
@@ -665,7 +636,7 @@ void HOGPyramid::Hog(const JPEGImage & image, Level & level, int padx, int pady,
 									   level(y    , x + 1)(NbFeatures - 1) +
 									   level(y + 1, x    )(NbFeatures - 1) +
 									   level(y + 1, x + 1)(NbFeatures - 1) + EPS);
-			
+
 			// Contrast-insensitive features
 			for (int i = 0; i < 9; ++i) {
 				const Scalar sum = level(y, x)(i) + level(y, x)(i + 9);
@@ -675,13 +646,13 @@ void HOGPyramid::Hog(const JPEGImage & image, Level & level, int padx, int pady,
 				const Scalar h3 = min(sum * n3, Scalar(0.2));
 				level(y, x)(i + 18) = (h0 + h1 + h2 + h3) * Scalar(0.5);
 			}
-			
+
 			// Contrast-sensitive features
 			Scalar t0 = 0;
 			Scalar t1 = 0;
 			Scalar t2 = 0;
 			Scalar t3 = 0;
-			
+
 			for (int i = 0; i < 18; ++i) {
 				const Scalar sum = level(y, x)(i);
 				const Scalar h0 = min(sum * n0, Scalar(0.2));
@@ -694,7 +665,7 @@ void HOGPyramid::Hog(const JPEGImage & image, Level & level, int padx, int pady,
 				t2 += h2;
 				t3 += h3;
 			}
-			
+
 			// Texture features
 			level(y, x)(27) = t0 * Scalar(0.2357);
 			level(y, x)(28) = t1 * Scalar(0.2357);
@@ -702,7 +673,7 @@ void HOGPyramid::Hog(const JPEGImage & image, Level & level, int padx, int pady,
 			level(y, x)(30) = t3 * Scalar(0.2357);
 		}
 	}
-	
+
 	// Truncation features
 	for (int y = 0; y < level.rows(); ++y) {
 		for (int x = 0; x < level.cols(); ++x) {
@@ -723,69 +694,69 @@ void HOGPyramid::Hog(const uint8_t * bits, int width, int height, int depth, Lev
 {
 	// Adapted from voc-release4.01/features.cc
 	const Scalar EPS = 0.0001;
-	
+
 	const Scalar UU[9] = {
 		1.0000, 0.9397, 0.7660, 0.5000, 0.1736,-0.1736,-0.5000,-0.7660,-0.9397
 	};
-	
+
 	const Scalar VV[9] = {
 		0.0000, 0.3420, 0.6428, 0.8660, 0.9848, 0.9848, 0.8660, 0.6428, 0.3420
 	};
-	
+
 	// Make sure all sizes are strictly positive
 	assert(width > 0);
 	assert(height > 0);
 	assert(depth > 0);
 	assert(cellSize > 0);
-	
+
 	// Memory for caching orientation histograms & their norms
 	int blocks[2];
 	blocks[0] = static_cast<double>(height) / cellSize + 0.5;
 	blocks[1] = static_cast<double>(width) / cellSize + 0.5;
 	MatrixXf hist = MatrixXf::Zero(blocks[0], blocks[1] * 18);
 	MatrixXf norm = MatrixXf::Zero(blocks[0], blocks[1]);
-	
+
 	// Memory for HOG features
 	int out[3];
 	out[0] = max(blocks[0] - 2, 0);
 	out[1] = max(blocks[1] - 2, 0);
 	out[2] = 27 + 4 + 1;
 	level.resize(out[0], out[1]);
-	
+
 	int visible[2];
 	visible[0] = blocks[0] * cellSize;
 	visible[1] = blocks[1] * cellSize;
-	
+
 	for (int y = 1; y < visible[0] - 1; ++y) {
 		for (int x = 1; x < visible[1] - 1; ++x) {
 			const int x2 = min(x, width - 2);
 			const int y2 = min(y, height - 2);
-			
+
 			// Use the channel with the largest gradient magnitude
 			Scalar magnitude = 0;
 			int argDx = 0;
 			int argDy = 0;
-			
+
 			for (int i = 0; i < depth; ++i) {
 				const int dx = static_cast<int>(bits[(y2 * width + x2 + 1) * depth + i]) -
 							   static_cast<int>(bits[(y2 * width + x2 - 1) * depth + i]);
 				const int dy = static_cast<int>(bits[((y2 + 1) * width + x2) * depth + i]) -
 							   static_cast<int>(bits[((y2 - 1) * width + x2) * depth + i]);
-				
+
 				if (dx * dx + dy * dy > magnitude) {
 					magnitude = dx * dx + dy * dy;
 					argDx = dx;
 					argDy = dy;
 				}
 			}
-			
+
 			// Snap to one of 18 orientations
 			int theta = 0;
 			Scalar best = 0;
-			
+
 			for (int i = 0; i < 9; ++i) {
 				const Scalar dot = UU[i] * argDx + VV[i] * argDy;
-				
+
 				if (dot > best) {
 					best = dot;
 					theta = i;
@@ -795,7 +766,7 @@ void HOGPyramid::Hog(const uint8_t * bits, int width, int height, int depth, Lev
 					theta = i + 9;
 				}
 			}
-			
+
 			// Add to 4 histograms around pixel using linear interpolation
 			Scalar xp = (x + Scalar(0.5)) / cellSize - Scalar(0.5);
 			Scalar yp = (y + Scalar(0.5)) / cellSize - Scalar(0.5);
@@ -805,36 +776,36 @@ void HOGPyramid::Hog(const uint8_t * bits, int width, int height, int depth, Lev
 			Scalar vy0 = yp - iyp;
 			Scalar vx1 = 1 - vx0;
 			Scalar vy1 = 1 - vy0;
-			
+
 			magnitude = sqrt(magnitude);
-			
+
 			if ((ixp >= 0) && (iyp >= 0))
 				hist(iyp, ixp * 18 + theta) += vx1 * vy1 * magnitude;
-			
+
 			if ((ixp + 1 < blocks[1]) && (iyp >= 0))
 				hist(iyp, (ixp + 1) * 18 + theta) += vx0 * vy1 * magnitude;
-			
+
 			if ((ixp >= 0) && (iyp + 1 < blocks[0]))
 				hist(iyp + 1, ixp * 18 + theta) += vx1 * vy0 * magnitude;
-			
+
 			if ((ixp + 1 < blocks[1]) && (iyp + 1 < blocks[0]))
 				hist(iyp + 1, (ixp + 1) * 18 + theta) += vx0 * vy0 * magnitude;
 		}
 	}
-	
+
 	// Compute energy in each block by summing over orientations
 	for (int y = 0; y < blocks[0]; ++y) {
 		for (int x = 0; x < blocks[1]; ++x) {
 			Scalar sumSq = 0;
-			
+
 			for (int i = 0; i < 9; ++i)
 				sumSq += (hist(y, x * 18 + i) + hist(y, x * 18 + i + 9)) *
 						 (hist(y, x * 18 + i) + hist(y, x * 18 + i + 9));
-			
+
 			norm(y, x) = sumSq;
 		}
 	}
-	
+
 	// Compute features
 	for (int y = 0; y < out[0]; ++y) {
 		for (int x = 0; x < out[1]; ++x) {
@@ -847,7 +818,7 @@ void HOGPyramid::Hog(const uint8_t * bits, int width, int height, int depth, Lev
 											norm(y + 2, x    ) + norm(y + 2, x + 1) + EPS);
 			const Scalar n3 = 1 / sqrt(norm(y + 1, x + 1) + norm(y + 1, x + 2) +
 											norm(y + 2, x + 1) + norm(y + 2, x + 2) + EPS);
-			
+
 			// Contrast-insensitive features
 			for (int i = 0; i < 9; ++i) {
 				const Scalar sum = hist(y + 1, (x + 1) * 18 + i) +
@@ -858,13 +829,13 @@ void HOGPyramid::Hog(const uint8_t * bits, int width, int height, int depth, Lev
 				const Scalar h3 = min(sum * n3, Scalar(0.2));
 				level(y, x)(i + 18) = (h0 + h1 + h2 + h3) / 2;
 			}
-			
+
 			// Contrast-sensitive features
 			Scalar t0 = 0;
 			Scalar t1 = 0;
 			Scalar t2 = 0;
 			Scalar t3 = 0;
-			
+
 			for (int i = 0; i < 18; ++i) {
 				const Scalar sum = hist(y + 1, (x + 1) * 18 + i);
 				const Scalar h0 = min(sum * n0, Scalar(0.2));
@@ -877,7 +848,7 @@ void HOGPyramid::Hog(const uint8_t * bits, int width, int height, int depth, Lev
 				t2 += h2;
 				t3 += h3;
 			}
-			
+
 			// Texture features
 			level(y, x)(27) = t0 * Scalar(0.2357);
 			level(y, x)(28) = t1 * Scalar(0.2357);
@@ -885,7 +856,7 @@ void HOGPyramid::Hog(const uint8_t * bits, int width, int height, int depth, Lev
 			level(y, x)(30) = t3 * Scalar(0.2357);
 		}
 	}
-	
+
 	// Truncation feature
 	for (int y = 0; y < level.rows(); ++y)
 		for (int x = 0; x < level.cols(); ++x)
@@ -900,9 +871,9 @@ void HOGPyramid::Convolve(const Level & x, const Level & y, Matrix & z)
 		z = Matrix();
 		return;
 	}
-	
+
 	z = Matrix::Zero(x.rows() - y.rows() + 1, x.cols() - y.cols() + 1);
-	
+
 	for (int i = 0; i < z.rows(); ++i) {
 		for (int j = 0; j < y.rows(); ++j) {
 			const Map<const Matrix, Aligned, OuterStride<NbFeatures> >
@@ -914,7 +885,7 @@ void HOGPyramid::Convolve(const Level & x, const Level & y, Matrix & z)
 			const Map<const RowVectorXd, Aligned>
 #endif
 				mapy(reinterpret_cast<const Scalar *>(y.row(j).data()), y.cols() * NbFeatures);
-			
+
 			z.row(i).noalias() += mapy * mapx.transpose();
 		}
 	}
@@ -927,17 +898,17 @@ void HOGPyramid::Convolve(const Level & x, const Level & y, SparseMatrix & z)
 		z = SparseMatrix();
 		return;
 	}
-	
+
 	assert(z.rows() == x.rows() - y.rows() + 1);
 	assert(z.cols() == x.cols() - y.cols() + 1);
-	
+
 	// Iterate over the non-zero entries of the samples matrix
 	for (int i = 0; i < z.rows(); ++i) {
 		z.startVec(i);
-		
+
 		for (SparseMatrix::InnerIterator it(z, i); it; ++it) {
 			Scalar dot = 0;
-			
+
 			for (int j = 0; j < y.rows(); ++j) {
 #ifndef FFLD_HOGPYRAMID_DOUBLE
 				const Map<const RowVectorXf, Aligned>
@@ -946,21 +917,21 @@ void HOGPyramid::Convolve(const Level & x, const Level & y, SparseMatrix & z)
 #endif
 					mapx(reinterpret_cast<const Scalar *>(x.row(i + j).data() + it.col()),
 						 y.cols() * NbFeatures);
-				
+
 #ifndef FFLD_HOGPYRAMID_DOUBLE
 				const Map<const RowVectorXf, Aligned>
 #else
 				const Map<const RowVectorXd, Aligned>
 #endif
 					mapy(reinterpret_cast<const Scalar *>(y.row(j).data()), y.cols() * NbFeatures);
-				
+
 				dot += mapx.dot(mapy);
 			}
-			
+
 			it.valueRef() = dot;
 		}
 	}
-	
+
 	z.finalize();
 }
 
@@ -971,22 +942,22 @@ void HOGPyramid::Convolve(const Level & x, const Matrix & z, Level & y)
 		y = Level();
 		return;
 	}
-	
+
 	y = Level::Constant(x.rows() - z.rows() + 1, x.cols() - z.cols() + 1, Cell::Zero());
-	
+
 	for (int i = 0; i < z.rows(); ++i) {
 		for (int j = 0; j < y.rows(); ++j) {
 			const Map<const Matrix, Aligned, OuterStride<NbFeatures> >
 				mapx(reinterpret_cast<const Scalar *>(x.row(i + j).data()), z.cols(),
 					 y.cols() * NbFeatures);
-			
+
 #ifndef FFLD_HOGPYRAMID_DOUBLE
 			Map<RowVectorXf, Aligned>
 #else
 			Map<RowVectorXd, Aligned>
 #endif
 				mapy(reinterpret_cast<Scalar *>(y.row(j).data()), y.cols() * NbFeatures);
-			
+
 			mapy.noalias() += z.row(i) * mapx;
 		}
 	}
@@ -999,15 +970,15 @@ void HOGPyramid::Convolve(const Level & x, const SparseMatrix & z, Level & y)
 		y = Level();
 		return;
 	}
-	
+
 	const Map<const Matrix, Aligned>
 		mapx(reinterpret_cast<const Scalar *>(x.data()), x.rows(), x.cols() * NbFeatures);
-	
+
 	y = Level::Constant(x.rows() - z.rows() + 1, x.cols() - z.cols() + 1, Cell::Zero());
-	
+
 	Map<Matrix, Aligned>
 		mapy(reinterpret_cast<Scalar *>(y.data()), y.rows(), y.cols() * NbFeatures);
-	
+
 	// Iterate over the non-zero entries of the z matrix
 	for (int i = 0; i < z.rows(); ++i)
 		for (SparseMatrix::InnerIterator it(z, i); it; ++it)

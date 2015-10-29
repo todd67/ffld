@@ -76,6 +76,18 @@ public:
 	void convolve(const HOGPyramid & pyramid, std::vector<HOGPyramid::Matrix> & scores,
 				  std::vector<std::vector<Positions> > * positions = 0) const;
 	
+#ifdef USE_CUDNN
+	Model(const Model& m) : parts_(m.parts_), bias_(m.bias_) {}
+
+	Model& operator=(const Model& m) { parts_ = m.parts_; bias_ = m.bias_; return *this;}
+
+	~Model() { cudnn_release(); }
+
+	/// Prepare the filters for cudnn convolution
+	void cudnn_prepare();
+	void cudnn_release();
+#endif
+
 	/// Returns the flipped version (horizontally) of a model or a fixed sample.
 	Model flip() const;
 	
@@ -111,7 +123,7 @@ private:
 				  std::vector<std::vector<HOGPyramid::Matrix> > & convolutions,
 				  std::vector<HOGPyramid::Matrix> & scores,
 				  std::vector<std::vector<Positions> > * positions = 0) const;
-	
+
 	/// Computes a 1D quadratic distance transform (maximum convolution with a quadratic
 	/// function) in linear time. For every position @c i it computes the maxima
 	/// @code y[i] = \max_j x[j] + a * (i + offset - j)^2 + b * (i + offset - j) @endcode
@@ -147,6 +159,11 @@ private:
 	
 	std::vector<Part> parts_; ///< The parts making up the model (the first one is the root).
 	Scalar bias_; ///< The model bias.
+
+#ifdef USE_CUDNN
+	std::unique_ptr<caffe::Blob<HOGPyramid::Scalar>> weight_;
+	cudnnFilterDescriptor_t	filter_desc_;
+#endif
 };
 
 /// Serializes a model to a stream.

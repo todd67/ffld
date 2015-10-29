@@ -67,6 +67,10 @@ public:
 	
 	/// Cache the transformed version of the models' filters.
 	void cacheFilters() const;
+
+#ifdef USE_CUDNN
+	void cudnn_prepare();
+#endif
 	
 private:
 	/// Returns the scores of the convolutions + distance transforms of the models with a
